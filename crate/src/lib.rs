@@ -1,14 +1,20 @@
 use filmshell::game::{Grenade, Level, LevelBox};
+use filmshell::research::{
+    components::Params,
+    container::{Film as RawFilm, Framing},
+    payload::{self, Reader},
+    zones as research_zones,
+};
 use filmshell::{
     Ammo, Chunk, ChunkKind, Coordinates, Energy, EquipmentCharge, Event, Film, GameMode,
-    GameVariant, GrenadeCount, GroundWeapon, Header, Heat, Highlight, HillScore, Input, Kill, Life,
-    MedalAward, Player, PlayerId, Ride, Sample, Scoreboard, Tick, TimedEvent, Vehicle, WorldObject,
-    Zone,
+    GameVariant, GrenadeCount, GroundWeapon, Header, Heat, Highlight, Input, Kill, Life,
+    MedalAward, Player, PlayerId, Ride, Sample, Scoreboard, TeamId, Tick, TimedEvent, Vehicle,
+    WorldObject, Zone,
 };
 use js_sys::{Array, ArrayBuffer, Reflect, Uint8Array};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wasm_bindgen::{prelude::*, JsCast};
 
 #[derive(Serialize)]
@@ -28,13 +34,26 @@ struct FilmData<'a> {
     ground_weapons: &'a [GroundWeapon],
     grenade_flights: Vec<GrenadeFlightData<'a>>,
     zones: &'a [Zone],
-    hill_score: Option<&'a HillScore>,
+    hill_score: Option<HillScoreData>,
     events: Vec<Cow<'a, TimedEvent>>,
     kills: Vec<KillData<'a>>,
     highlights: &'a [Highlight],
     medals: Vec<MedalData>,
     scoreboard: &'a Scoreboard,
     states: Vec<PlayerStateData<'a>>,
+}
+
+#[derive(Deserialize)]
+struct PlayerTeamInput {
+    xuid: String,
+    team: u32,
+}
+
+#[derive(Serialize)]
+struct HillScoreData {
+    points_to_win: u32,
+    hills_to_win: u32,
+    points: Vec<(Tick, TeamId, u32)>,
 }
 
 #[derive(Serialize)]
@@ -509,6 +528,17 @@ impl<'a> From<&'a Level> for LevelData<'a> {
 
 #[wasm_bindgen]
 pub fn parse_film(chunks: &JsValue) -> Result<String, JsValue> {
+    parse_film_inner(chunks, &[])
+}
+
+#[wasm_bindgen]
+pub fn parse_film_with_teams(chunks: &JsValue, teams_json: &str) -> Result<String, JsValue> {
+    let teams: Vec<PlayerTeamInput> =
+        serde_json::from_str(teams_json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    parse_film_inner(chunks, &teams)
+}
+
+fn parse_film_inner(chunks: &JsValue, teams: &[PlayerTeamInput]) -> Result<String, JsValue> {
     let chunks = Array::from(chunks)
         .iter()
         .map(|input| {
@@ -525,6 +555,14 @@ pub fn parse_film(chunks: &JsValue) -> Result<String, JsValue> {
         })
         .collect::<Result<Vec<_>, JsValue>>()?;
     let film = Film::from_chunks(chunks).map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let hill_score = film
+        .hill_score()
+        .map(|hill| HillScoreData {
+            points_to_win: hill.points_to_win,
+            hills_to_win: hill.hills_to_win,
+            points: hill.points.clone(),
+        })
+        .or_else(|| hill_score_with_teams(&film, teams));
     let clock = film.clock();
     let lives = authoritative_lives(&film);
     let owners: Vec<_> = film
@@ -582,7 +620,7 @@ pub fn parse_film(chunks: &JsValue) -> Result<String, JsValue> {
             })
             .collect(),
         zones: film.zones(),
-        hill_score: film.hill_score(),
+        hill_score,
         events: inventory_events(&film, &owners),
         kills: film
             .kills()
@@ -597,6 +635,86 @@ pub fn parse_film(chunks: &JsValue) -> Result<String, JsValue> {
         states: inventory_states(&film, &owners),
     };
     serde_json::to_string(&data).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+fn hill_score_with_teams(film: &Film, teams: &[PlayerTeamInput]) -> Option<HillScoreData> {
+    if film.mode() != GameMode::KingOfTheHill {
+        return None;
+    }
+    let level = film.level()?;
+    let team_by_xuid: HashMap<u64, u8> = teams
+        .iter()
+        .filter_map(|player| {
+            let xuid = player.xuid.parse().ok()?;
+            let team = u8::try_from(player.team).ok().filter(|team| *team < 2)?;
+            Some((xuid, team))
+        })
+        .collect();
+    let player_teams: Vec<_> = film
+        .players()
+        .iter()
+        .map(|player| {
+            player
+                .xuid()
+                .and_then(|xuid| team_by_xuid.get(&xuid.0).copied())
+                .or_else(|| player.team.map(|team| team.0))
+                .filter(|team| *team < 2)
+                .map(i32::from)
+        })
+        .collect();
+    if !player_teams.iter().any(Option::is_some) {
+        return None;
+    }
+
+    let raw = film.raw();
+    let first_frame = raw.frames().next()?;
+    let framing = if first_frame.timestamp_us.is_some() {
+        Framing::Packets
+    } else {
+        Framing::Markers
+    };
+    let mut chunks = vec![raw.header_chunk().to_vec()];
+    chunks.extend(raw.replay_chunks().map(|(_, chunk)| chunk.to_vec()));
+    if let Some(highlights) = raw.highlights_chunk() {
+        chunks.push(highlights.to_vec());
+    }
+    let raw_film = RawFilm::new(chunks, framing);
+
+    let mut params = Params::new(level.play.widths);
+    params.box_bits = level.index_bits;
+    params.play_box = level.play.index;
+    for other in level.others {
+        if let Some(widths) = params.box_widths.get_mut(other.index as usize) {
+            *widths = other.widths;
+        }
+    }
+    let team_of = |player: i32| {
+        usize::try_from(player)
+            .ok()
+            .and_then(|index| player_teams.get(index))
+            .copied()
+            .flatten()
+    };
+    let mut decoded = research_zones::HillScore::default();
+    let mut hill_reader = research_zones::hill_score_reader(team_of, &mut decoded);
+    let mut readers: [&mut Reader<'_>; 1] = [&mut hill_reader];
+    payload::walk_shared(&raw_film, params, &mut readers);
+    drop(readers);
+    drop(hill_reader);
+    let decoded = research_zones::finish_hill_score(decoded)?;
+    let points = decoded
+        .runs
+        .into_iter()
+        .filter_map(|(frame, team, points)| {
+            let tick = film.clock().tick(usize::try_from(frame).ok()?)?;
+            Some((tick, TeamId(u8::try_from(team).ok()?), points))
+        })
+        .collect::<Vec<_>>();
+    (!points.is_empty()).then_some(HillScoreData {
+        points_to_win: decoded.to_win,
+        hills_to_win: decoded.hills,
+        points,
+    })
 }
 
 fn read_u32(value: &JsValue, field: &str) -> Result<u32, JsValue> {
