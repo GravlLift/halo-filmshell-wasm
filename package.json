@@ -1,0 +1,11 @@
+{
+  "name": "@gravllift/libfilmshell-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "scripts": {
+    "build": "cargo build --release --target wasm32-unknown-unknown --manifest-path crate/Cargo.toml && wasm-bindgen --target web --out-dir ../../packages/halo-query/public/wasm --out-name libfilmshell_wasm crate/target/wasm32-unknown-unknown/release/halo_filmshell_wasm.wasm"
+  }
+}
