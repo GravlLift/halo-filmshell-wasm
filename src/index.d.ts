@@ -1,4 +1,7 @@
-import type { FilmChunkInput, FilmData } from '../../halo-film/src/film-data';
+import type {
+  FilmChunkInput,
+  FilmData,
+} from '../../halo-helpers/src/film-data';
 
 export interface FilmPlayerTeam {
   xuid: string;
@@ -14,7 +17,7 @@ export type {
   FilmParser,
   FilmPlayerStateData,
   JsonValue,
-} from '../../halo-film/src/film-data';
+} from '../../halo-helpers/src/film-data';
 
 export function parseFilm(chunks: FilmChunkInput[]): Promise<FilmData>;
 export function parseFilmWithTeams(

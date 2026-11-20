@@ -5,7 +5,22 @@
   "type": "module",
   "main": "src/index.js",
   "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "require": "./src/node.js"
+    },
+    "./node": {
+      "types": "./src/node.d.ts",
+      "import": "./src/node.js",
+      "require": "./src/node.js"
+    }
+  },
   "scripts": {
     "build": "cargo build --release --target wasm32-unknown-unknown --manifest-path crate/Cargo.toml && wasm-bindgen --target web --out-dir ../../packages/halo-query/public/wasm --out-name libfilmshell_wasm crate/target/wasm32-unknown-unknown/release/halo_filmshell_wasm.wasm"
+  },
+  "dependencies": {
+    "@gravllift/halo-helpers": "0.0.0"
   }
 }
