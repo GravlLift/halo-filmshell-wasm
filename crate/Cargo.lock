@@ -23,7 +23,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 [[package]]
 name = "filmshell"
 version = "0.1.0"
-source = "git+https://github.com/OpenSpartan/libfilmshell?rev=8f0f8d078e513c800baa21fac416fd4c0c127d03#8f0f8d078e513c800baa21fac416fd4c0c127d03"
+source = "git+https://github.com/OpenSpartan/libfilmshell?rev=031e2179f0758314e2a97fb96438c7b1e82ce1fb#031e2179f0758314e2a97fb96438c7b1e82ce1fb"
 dependencies = [
  "indexmap",
  "serde",

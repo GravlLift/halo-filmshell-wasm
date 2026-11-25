@@ -6,10 +6,10 @@ use filmshell::research::{
     zones as research_zones,
 };
 use filmshell::{
-    Ammo, Chunk, ChunkKind, Coordinates, Energy, EquipmentCharge, Event, Film, GameMode,
+    Ammo, Chunk, ChunkKind, Coordinates, Energy, EntityId, EquipmentCharge, Event, Film, GameMode,
     GameVariant, GrenadeCount, GroundWeapon, Header, Heat, Highlight, Input, Kill, Life,
-    MedalAward, Player, PlayerId, Ride, Sample, Scoreboard, TeamId, Tick, TimedEvent, Vehicle,
-    WorldObject, Zone,
+    MedalAward, PathPoint, Player, PlayerId, Ride, Sample, Scoreboard, TeamId, Tick, TimedEvent,
+    VehicleTrack, WorldObject, Zone,
 };
 use js_sys::{Array, ArrayBuffer, Reflect, Uint8Array};
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ struct FilmData<'a> {
     level: Option<LevelData<'a>>,
     coordinates: Option<&'a Coordinates>,
     lives: Vec<LifeData<'a>>,
-    vehicles: &'a [Vehicle],
+    vehicles: &'a [VehicleTrack],
     rides: Vec<Ride>,
     world_objects: &'a [WorldObject],
     ground_weapons: &'a [GroundWeapon],
@@ -53,7 +53,20 @@ struct PlayerTeamInput {
 struct HillScoreData {
     points_to_win: u32,
     hills_to_win: u32,
-    points: Vec<(Tick, TeamId, u32)>,
+    points: Vec<HillPointData>,
+}
+
+#[derive(Serialize)]
+struct HillPointData {
+    tick: Tick,
+    team: TeamId,
+    points: u32,
+}
+
+#[derive(Serialize)]
+struct HitchData {
+    at: u32,
+    skipped: u32,
 }
 
 #[derive(Serialize)]
@@ -64,7 +77,7 @@ struct FilmClock<'a> {
     end: filmshell::Tick,
     ticks_per_frame: u32,
     highlight_zero: Option<f64>,
-    hitches: Vec<(u32, u32)>,
+    hitches: Vec<HitchData>,
 }
 
 #[derive(Serialize)]
@@ -98,7 +111,7 @@ struct PlayerStateData<'a> {
 struct GrenadeFlightData<'a> {
     player: PlayerId,
     grenade: Option<Grenade>,
-    path: &'a [(Tick, filmshell::Position)],
+    path: &'a [PathPoint],
     end: Tick,
     deleted: bool,
 }
@@ -183,7 +196,7 @@ fn inventory_events<'a>(film: &'a Film, owners: &[PathOwner]) -> Vec<Cow<'a, Tim
 fn inventory_states<'a>(film: &'a Film, owners: &[PathOwner]) -> Vec<PlayerStateData<'a>> {
     let mut states: BTreeMap<PlayerId, InventoryStateData<'a>> = BTreeMap::new();
     for player in film.players() {
-        let Some(source) = film.state(player.id) else {
+        let Some(source) = film.player_state(player.id) else {
             continue;
         };
         states.entry(player.id).or_default().inputs = &source.inputs;
@@ -253,7 +266,7 @@ struct MedalData {
 #[derive(Serialize)]
 struct LifeData<'a> {
     player: Option<PlayerId>,
-    entity: Option<u16>,
+    entity: Option<EntityId>,
     died: bool,
     death: Option<Tick>,
     samples: &'a [Sample],
@@ -303,7 +316,7 @@ fn metadata_players(payload: &[u8], players: &BTreeMap<u64, PlayerId>) -> BTreeM
         .collect()
 }
 
-fn biped_creations(payload: &[u8]) -> Vec<(u16, u8)> {
+fn biped_creations(payload: &[u8]) -> Vec<(EntityId, u8)> {
     let mut found = Vec::new();
     let mut bit = 0;
     let limit = payload.len() as u64 * 8;
@@ -329,7 +342,10 @@ fn biped_creations(payload: &[u8]) -> Vec<(u16, u8)> {
             continue;
         }
         let player = header.read(5) as u8;
-        found.push((((generation - 1) * 256 + index - 512) as u16, player));
+        found.push((
+            EntityId(((generation - 1) * 256 + index - 512) as u16),
+            player,
+        ));
         bit += 72;
     }
     found
@@ -352,9 +368,9 @@ fn body_death(
 
 fn owner_at_start(
     start: Tick,
-    owners: &BTreeMap<u16, Vec<(Tick, PlayerId)>>,
-    claimed: &BTreeSet<(u16, Tick)>,
-) -> Option<(u16, Tick, PlayerId)> {
+    owners: &BTreeMap<EntityId, Vec<(Tick, PlayerId)>>,
+    claimed: &BTreeSet<(EntityId, Tick)>,
+) -> Option<(EntityId, Tick, PlayerId)> {
     let mut candidates = owners.iter().flat_map(|(&entity, entries)| {
         entries.iter().filter_map(move |&(tick, player)| {
             (tick == start && !claimed.contains(&(entity, tick))).then_some((entity, tick, player))
@@ -367,11 +383,11 @@ fn owner_at_start(
 fn owner_for_life(
     start: Tick,
     end: Tick,
-    owners: &BTreeMap<u16, Vec<(Tick, PlayerId)>>,
-    claimed: &BTreeSet<(u16, Tick)>,
+    owners: &BTreeMap<EntityId, Vec<(Tick, PlayerId)>>,
+    claimed: &BTreeSet<(EntityId, Tick)>,
     deaths: &[(Tick, PlayerId)],
     slack: u32,
-) -> Option<(u16, Tick, PlayerId)> {
+) -> Option<(EntityId, Tick, PlayerId)> {
     let mut candidates = Vec::new();
     for (&entity, entries) in owners {
         for &(spawn, player) in entries {
@@ -416,7 +432,7 @@ fn authoritative_lives(film: &Film) -> Vec<LifeData<'_>> {
             rosters.insert(packet.chunk, roster);
         }
     }
-    let mut owners: BTreeMap<u16, Vec<(Tick, PlayerId)>> = BTreeMap::new();
+    let mut owners: BTreeMap<EntityId, Vec<(Tick, PlayerId)>> = BTreeMap::new();
     for frame in raw.frames() {
         let Some((_, roster)) = rosters.range(..=frame.chunk).next_back() else {
             continue;
@@ -560,7 +576,15 @@ fn parse_film_inner(chunks: &JsValue, teams: &[PlayerTeamInput]) -> Result<Strin
         .map(|hill| HillScoreData {
             points_to_win: hill.points_to_win,
             hills_to_win: hill.hills_to_win,
-            points: hill.points.clone(),
+            points: hill
+                .points
+                .iter()
+                .map(|point| HillPointData {
+                    tick: point.tick,
+                    team: point.team,
+                    points: point.points,
+                })
+                .collect(),
         })
         .or_else(|| hill_score_with_teams(&film, teams));
     let clock = film.clock();
@@ -586,7 +610,14 @@ fn parse_film_inner(chunks: &JsValue, teams: &[PlayerTeamInput]) -> Result<Strin
             end: clock.end(),
             ticks_per_frame: clock.ticks_per_frame(),
             highlight_zero: clock.highlight_zero(),
-            hitches: clock.hitches(),
+            hitches: clock
+                .hitches()
+                .into_iter()
+                .map(|hitch| HitchData {
+                    at: hitch.at,
+                    skipped: hitch.skipped,
+                })
+                .collect(),
         },
         players: film.players(),
         variant: film.variant(),
@@ -607,11 +638,11 @@ fn parse_film_inner(chunks: &JsValue, teams: &[PlayerTeamInput]) -> Result<Strin
         world_objects: film.world_objects(),
         ground_weapons: film.ground_weapons(),
         grenade_flights: film
-            .grenade_flights()
+            .grenades()
             .iter()
             .map(|flight| GrenadeFlightData {
-                player: flight.path.first().map_or(flight.player, |(tick, _)| {
-                    path_player(flight.player, *tick, &owners)
+                player: flight.path.first().map_or(flight.player, |point| {
+                    path_player(flight.player, point.tick, &owners)
                 }),
                 grenade: flight.grenade,
                 path: &flight.path,
@@ -707,7 +738,11 @@ fn hill_score_with_teams(film: &Film, teams: &[PlayerTeamInput]) -> Option<HillS
         .into_iter()
         .filter_map(|(frame, team, points)| {
             let tick = film.clock().tick(usize::try_from(frame).ok()?)?;
-            Some((tick, TeamId(u8::try_from(team).ok()?), points))
+            Some(HillPointData {
+                tick,
+                team: TeamId(u8::try_from(team).ok()?),
+                points,
+            })
         })
         .collect::<Vec<_>>();
     (!points.is_empty()).then_some(HillScoreData {
@@ -812,7 +847,7 @@ mod tests {
         ] {
             write_bits(&mut bits, value, width);
         }
-        assert_eq!(biped_creations(&bytes(&bits)), vec![(341, 4)]);
+        assert_eq!(biped_creations(&bytes(&bits)), vec![(EntityId(341), 4)]);
         bits[5 + 24] = 0;
         assert!(biped_creations(&bytes(&bits)).is_empty());
     }
@@ -841,14 +876,18 @@ mod tests {
 
     #[test]
     fn recovers_an_unassigned_track_only_from_a_unique_unclaimed_creation() {
-        let owners = BTreeMap::from([(14, vec![(Tick(4804), PlayerId(4))])]);
+        let owners = BTreeMap::from([(EntityId(14), vec![(Tick(4804), PlayerId(4))])]);
         assert_eq!(
             owner_at_start(Tick(4804), &owners, &BTreeSet::new()),
-            Some((14, Tick(4804), PlayerId(4)))
+            Some((EntityId(14), Tick(4804), PlayerId(4)))
         );
         assert_eq!(owner_at_start(Tick(4805), &owners, &BTreeSet::new()), None);
         assert_eq!(
-            owner_at_start(Tick(4804), &owners, &BTreeSet::from([(14, Tick(4804))])),
+            owner_at_start(
+                Tick(4804),
+                &owners,
+                &BTreeSet::from([(EntityId(14), Tick(4804))])
+            ),
             None
         );
     }
@@ -856,8 +895,8 @@ mod tests {
     #[test]
     fn does_not_guess_between_creations_on_the_same_tick() {
         let owners = BTreeMap::from([
-            (14, vec![(Tick(4804), PlayerId(4))]),
-            (15, vec![(Tick(4804), PlayerId(3))]),
+            (EntityId(14), vec![(Tick(4804), PlayerId(4))]),
+            (EntityId(15), vec![(Tick(4804), PlayerId(3))]),
         ]);
         assert_eq!(owner_at_start(Tick(4804), &owners, &BTreeSet::new()), None);
     }
@@ -865,8 +904,8 @@ mod tests {
     #[test]
     fn recovers_a_late_position_track_only_with_a_unique_creation_and_death_interval() {
         let owners = BTreeMap::from([
-            (14, vec![(Tick(4804), PlayerId(4))]),
-            (15, vec![(Tick(4900), PlayerId(3))]),
+            (EntityId(14), vec![(Tick(4804), PlayerId(4))]),
+            (EntityId(15), vec![(Tick(4900), PlayerId(3))]),
         ]);
         let deaths = [(Tick(5500), PlayerId(4)), (Tick(5500), PlayerId(3))];
         assert_eq!(
@@ -878,7 +917,7 @@ mod tests {
                 &deaths,
                 2
             ),
-            Some((14, Tick(4804), PlayerId(4)))
+            Some((EntityId(14), Tick(4804), PlayerId(4)))
         );
         assert_eq!(
             owner_for_life(
@@ -896,7 +935,7 @@ mod tests {
                 Tick(4810),
                 Tick(5499),
                 &owners,
-                &BTreeSet::from([(14, Tick(4804))]),
+                &BTreeSet::from([(EntityId(14), Tick(4804))]),
                 &deaths,
                 2
             ),
